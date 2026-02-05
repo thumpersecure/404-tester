@@ -28,6 +28,7 @@ mod csp;
 mod cookie;
 mod header_profile;
 mod js;
+mod packet_headers;
 
 pub use alt_svc::AltSvcStage;
 pub use behavior::BehavioralNoiseStage;
@@ -35,6 +36,7 @@ pub use csp::CspStage;
 pub use cookie::CookieIsolationStage;
 pub use header_profile::HeaderProfileStage;
 pub use js::JsInjectionStage;
+pub use packet_headers::PacketHeaderStage;
 
 use std::sync::Arc;
 
@@ -66,6 +68,9 @@ impl StagePipeline {
             cfg.profiles_path.clone(),
             cfg.default_profile.clone(),
         )?));
+        // PacketHeaderStage runs after HeaderProfileStage to access fingerprint config,
+        // reorders HTTP headers for stealth and extracts TCP fingerprint hints for eBPF.
+        stages.push(Arc::new(PacketHeaderStage::new()));
         stages.push(Arc::new(BehavioralNoiseStage::new()));
         stages.push(Arc::new(CspStage::default()));
         stages.push(Arc::new(JsInjectionStage::new(cfg.js_debug)));

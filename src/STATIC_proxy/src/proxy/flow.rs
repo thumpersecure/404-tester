@@ -194,11 +194,14 @@ pub struct FlowMetadata {
     pub behavioral_noise: BehavioralNoiseMetadata,
 
     pub original_csp_headers: Option<Vec<(HeaderName, Vec<String>)>>,
+
+    /// Packet header context for HTTP header ordering and TCP fingerprint coordination.
+    pub packet_headers: PacketHeaderContext,
 }
 
 #[derive(Debug, Default)]
 pub struct BehavioralNoiseMetadata {
-    
+
     pub enabled: bool,
 
     pub plan: Option<BehavioralNoisePlan>,
@@ -206,4 +209,102 @@ pub struct BehavioralNoiseMetadata {
     pub engine_tag: Option<String>,
 
     pub markers: Vec<String>,
+}
+
+/// PacketHeaderContext tracks header ordering and TCP fingerprint metadata for stealth evasion.
+/// This enables the proxy to reorder HTTP headers to match real browser fingerprints and
+/// coordinate TCP-level fingerprint spoofing with the eBPF module.
+#[derive(Debug, Default, Clone)]
+pub struct PacketHeaderContext {
+    /// Whether packet header processing is enabled for this flow.
+    pub enabled: bool,
+
+    /// Original header names in the order they were received from the client.
+    pub original_header_order: Vec<String>,
+
+    /// Header names in the order they will be sent upstream (after reordering).
+    pub applied_header_order: Vec<String>,
+
+    /// Mapping of original header case to normalized case (e.g., "content-type" -> "Content-Type").
+    pub header_case_map: std::collections::HashMap<String, String>,
+
+    /// Deterministic fingerprint ID derived from flow ID for consistent per-session behavior.
+    pub packet_fingerprint_id: String,
+
+    /// HTTP/2 pseudo-header order applied (e.g., [":method", ":authority", ":scheme", ":path"]).
+    pub h2_pseudo_order: Vec<String>,
+
+    /// TCP fingerprint hints passed to coordinate with eBPF layer.
+    pub tcp_fingerprint: TcpFingerprintHints,
+
+    /// Markers for telemetry/debugging (e.g., "headers_reordered", "case_normalized").
+    pub markers: Vec<String>,
+}
+
+/// TCP fingerprint configuration hints coordinated between Rust proxy and eBPF module.
+/// These values can be set per-profile to match specific OS/browser combinations.
+#[derive(Debug, Clone)]
+pub struct TcpFingerprintHints {
+    /// Target OS for TCP fingerprinting (e.g., "windows", "linux", "macos").
+    pub target_os: String,
+
+    /// IP Time-To-Live value (common: Windows=128, Linux=64, macOS=64).
+    pub ttl: u8,
+
+    /// TCP Maximum Segment Size (common: 1460 for Ethernet MTU 1500).
+    pub mss: u16,
+
+    /// TCP Window Size for initial SYN packets.
+    pub window_size: u16,
+
+    /// TCP Window Scale factor (typically 5-8).
+    pub window_scale: u8,
+
+    /// Whether TCP timestamps should be included (Windows=false, Unix=true).
+    pub timestamps_enabled: bool,
+
+    /// TCP options order for SYN packets (OS-specific ordering).
+    /// Common patterns:
+    /// - Windows: [MSS, NOP, WS, NOP, NOP, SACK_PERM]
+    /// - Linux:   [MSS, SACK_PERM, TS, NOP, WS]
+    /// - macOS:   [MSS, NOP, WS, NOP, NOP, TS, SACK_PERM, EOL]
+    pub tcp_options_order: Vec<String>,
+
+    /// IP Don't Fragment flag (Windows typically sets DF=1).
+    pub df_flag: bool,
+
+    /// IP Type of Service / DSCP field value.
+    pub ip_tos: u8,
+
+    /// Whether to randomize IP ID field.
+    pub randomize_ip_id: bool,
+
+    /// Whether to randomize TCP initial sequence number.
+    pub randomize_seq: bool,
+}
+
+impl Default for TcpFingerprintHints {
+    fn default() -> Self {
+        // Default to Windows-like fingerprint (most common for Chrome/Edge)
+        Self {
+            target_os: "windows".to_string(),
+            ttl: 128,
+            mss: 1460,
+            window_size: 65535,
+            window_scale: 8,
+            timestamps_enabled: false,
+            tcp_options_order: vec![
+                "MSS".to_string(),
+                "NOP".to_string(),
+                "WS".to_string(),
+                "NOP".to_string(),
+                "NOP".to_string(),
+                "SACK_PERM".to_string(),
+            ],
+            df_flag: true,
+            ip_tos: 0x00,
+            randomize_ip_id: true,
+            randomize_seq: true,
+        }
+    }
 }

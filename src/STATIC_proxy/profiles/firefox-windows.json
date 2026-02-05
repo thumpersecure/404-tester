@@ -239,6 +239,73 @@
     ],
     "debug": false
   },
+  "packet_headers": {
+    "header_order": [
+      "host",
+      "user-agent",
+      "accept",
+      "accept-language",
+      "accept-encoding",
+      "dnt",
+      "connection",
+      "referer",
+      "cookie",
+      "upgrade-insecure-requests",
+      "sec-fetch-dest",
+      "sec-fetch-mode",
+      "sec-fetch-site",
+      "sec-fetch-user",
+      "cache-control",
+      "content-type",
+      "content-length",
+      "origin",
+      "te",
+      "if-none-match",
+      "if-modified-since"
+    ],
+    "h2_pseudo_order": [
+      ":method",
+      ":path",
+      ":authority",
+      ":scheme"
+    ],
+    "header_case": {
+      "host": "Host",
+      "user-agent": "User-Agent",
+      "accept": "Accept",
+      "accept-language": "Accept-Language",
+      "accept-encoding": "Accept-Encoding",
+      "dnt": "DNT",
+      "connection": "Connection",
+      "referer": "Referer",
+      "cookie": "Cookie",
+      "upgrade-insecure-requests": "Upgrade-Insecure-Requests",
+      "sec-fetch-dest": "Sec-Fetch-Dest",
+      "sec-fetch-mode": "Sec-Fetch-Mode",
+      "sec-fetch-site": "Sec-Fetch-Site",
+      "sec-fetch-user": "Sec-Fetch-User",
+      "cache-control": "Cache-Control",
+      "content-type": "Content-Type",
+      "content-length": "Content-Length",
+      "origin": "Origin",
+      "te": "TE",
+      "if-none-match": "If-None-Match",
+      "if-modified-since": "If-Modified-Since"
+    }
+  },
+  "tcp_fingerprint": {
+    "target_os": "windows",
+    "ttl": 128,
+    "mss": 1460,
+    "window_size": 65535,
+    "window_scale": 8,
+    "timestamps_enabled": false,
+    "tcp_options_order": ["MSS", "NOP", "WS", "NOP", "NOP", "SACK_PERM"],
+    "df_flag": true,
+    "ip_tos": 0,
+    "randomize_ip_id": true,
+    "randomize_seq": true
+  },
   "tls": {
     "schema_version": 2,
     "versions": {
