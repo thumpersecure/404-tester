@@ -17,15 +17,132 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 */
 
-//! PacketHeaderStage implements stealth-focused HTTP header ordering and TCP fingerprint
-//! coordination for fingerprint evasion. Real browsers send headers in specific, consistent
-//! orders that fingerprinting services use to detect proxy/bot traffic.
+//! # PacketHeaderStage - HTTP Header Ordering and TCP Fingerprint Coordination
 //!
-//! This stage:
-//! 1. Reorders HTTP/1.1 headers to match real browser fingerprints
-//! 2. Applies browser-specific header capitalization (HTTP/1.1 only)
-//! 3. Orders HTTP/2 pseudo-headers correctly
-//! 4. Extracts TCP fingerprint hints from profiles for eBPF coordination
+//! This module implements stealth-focused HTTP header reordering and TCP fingerprint
+//! coordination for fingerprint evasion. It's a critical component of the 404 proxy's
+//! anti-detection capabilities.
+//!
+//! ## Why Header Ordering Matters
+//!
+//! Real browsers send HTTP headers in specific, consistent orders determined by their
+//! implementation. Fingerprinting services like FingerprintJS, PerimeterX, Cloudflare
+//! Bot Management, and DataDome analyze these patterns to detect proxy/bot traffic.
+//!
+//! A request claiming to be Chrome but sending headers in Python-requests order (alphabetical
+//! or random) is immediately flagged. Even subtle differences like Accept-Encoding before
+//! User-Agent (Firefox) vs. User-Agent before Accept-Encoding (Chrome) are detectable.
+//!
+//! ## What This Stage Does
+//!
+//! 1. **HTTP/1.1 Header Reordering**: Reorders request headers to match the target browser's
+//!    expected order (Chrome, Firefox, or Edge patterns).
+//!
+//! 2. **Header Case Normalization**: While HTTP headers are case-insensitive per spec, browsers
+//!    use consistent capitalization (e.g., "User-Agent" not "user-agent"). HTTP/1.1 preserves
+//!    case on the wire, so mismatched case is detectable.
+//!
+//! 3. **HTTP/2 Pseudo-Header Ordering**: HTTP/2 uses pseudo-headers (:method, :authority,
+//!    :scheme, :path) that also have browser-specific ordering in HEADERS frames.
+//!
+//! 4. **TCP Fingerprint Extraction**: Reads TCP/IP fingerprint configuration from browser
+//!    profiles and populates hints for the eBPF kernel module to apply at the packet level.
+//!
+//! ## Pipeline Position
+//!
+//! This stage runs AFTER `HeaderProfileStage` in the pipeline. HeaderProfileStage loads the
+//! browser profile JSON and populates `flow.metadata.fingerprint_config`. PacketHeaderStage
+//! reads that config to determine the correct header ordering and TCP characteristics.
+//!
+//! ```text
+//! Request Flow:
+//! [Client] -> [TLS] -> [Parse] -> [CookieIsolation] -> [HeaderProfile] -> [PacketHeaders] -> ...
+//!                                                           |                    |
+//!                                                    loads profile          reorders headers
+//!                                                                          extracts TCP hints
+//! ```
+//!
+//! ## Configuration
+//!
+//! Header ordering and TCP fingerprints are configured per-profile in JSON files:
+//!
+//! ```json
+//! {
+//!   "fingerprint": {
+//!     "browser_type": "chrome",
+//!     "os": "Windows"
+//!   },
+//!   "packet_headers": {
+//!     "header_order": ["host", "connection", "cache-control", "sec-ch-ua", ...],
+//!     "h2_pseudo_order": [":method", ":authority", ":scheme", ":path"],
+//!     "header_case": {
+//!       "host": "Host",
+//!       "user-agent": "User-Agent",
+//!       "accept-encoding": "Accept-Encoding"
+//!     }
+//!   },
+//!   "tcp_fingerprint": {
+//!     "target_os": "windows",
+//!     "ttl": 128,
+//!     "mss": 1460,
+//!     "window_size": 65535,
+//!     "window_scale": 8,
+//!     "timestamps_enabled": false,
+//!     "tcp_options_order": ["MSS", "NOP", "WS", "NOP", "NOP", "SACK_PERM"]
+//!   }
+//! }
+//! ```
+//!
+//! If `packet_headers` isn't specified, the stage infers ordering from `fingerprint.browser_type`.
+//! If `tcp_fingerprint` isn't specified, it infers from `fingerprint.os`.
+//!
+//! ## Browser Header Order Differences
+//!
+//! Each browser has distinct header ordering. Key differences:
+//!
+//! ### Chrome (and Chromium-based)
+//! - Leads with: host, connection, cache-control, sec-ch-ua headers
+//! - User-Agent comes AFTER sec-ch-* client hints
+//! - sec-fetch-* headers appear as a group after accept
+//!
+//! ### Firefox
+//! - Leads with: host, user-agent, accept, accept-language
+//! - User-Agent is second (not ninth like Chrome)
+//! - No sec-ch-* headers (Firefox doesn't support Client Hints)
+//! - Includes TE header for transfer encodings
+//!
+//! ### Edge
+//! - Very similar to Chrome (same Chromium base)
+//! - Minor differences in sec-ch-ua-platform placement
+//! - Same general structure as Chrome
+//!
+//! ## Telemetry Markers
+//!
+//! The stage adds markers to `flow.metadata.packet_headers.markers` for debugging:
+//! - `headers_reordered`: Header order was changed from original
+//! - `tcp_target_os:{os}`: TCP fingerprint set to specific OS
+//! - `tcp_ttl:{value}`: TTL value being applied
+//! - `response_headers_processed`: Response headers were also processed
+//!
+//! ## Limitations
+//!
+//! 1. **HTTP library constraints**: The Rust `http` crate normalizes header names to lowercase
+//!    internally. Header case mapping is tracked in metadata but may not be preserved through
+//!    all serialization paths. Verify with packet captures.
+//!
+//! 2. **HTTP/2 pseudo-headers**: HTTP/2 header ordering in HPACK-compressed frames requires
+//!    coordination with the HTTP/2 implementation. Ensure the HTTP/2 codec respects ordering.
+//!
+//! 3. **TCP options reordering**: The eBPF module modifies TCP option VALUES but doesn't
+//!    reorder options in packets (would require packet reconstruction). For complete stealth,
+//!    consider implementing full TCP options reordering via raw sockets or nftables.
+//!
+//! ## Security Note
+//!
+//! Header ordering alone is not sufficient for complete stealth. Fingerprinting services
+//! correlate multiple signals: HTTP headers, TLS fingerprint (JA3/JA4), TCP/IP fingerprint,
+//! JavaScript execution environment, and behavioral patterns. The 404 proxy addresses these
+//! through multiple coordinated stages.
 
 use std::collections::HashMap;
 
@@ -39,13 +156,35 @@ use crate::proxy::flow::{Flow, PacketHeaderContext, TcpFingerprintHints};
 use super::FlowStage;
 
 /// PacketHeaderStage reorders HTTP headers and coordinates TCP fingerprint settings.
+///
+/// This stage is the core of HTTP-level fingerprint evasion. It transforms incoming
+/// requests to match real browser header patterns before forwarding upstream.
+///
+/// # Thread Safety
+///
+/// PacketHeaderStage is Clone and contains only default configuration data. Each request
+/// gets its own Flow with mutable state. The stage itself is immutable during processing.
+///
+/// # Example Usage
+///
+/// ```ignore
+/// let stage = PacketHeaderStage::new();
+/// stage.on_request(&mut flow).await?;
+/// // flow.request.headers is now reordered
+/// // flow.metadata.packet_headers contains TCP hints
+/// ```
 #[derive(Clone)]
 pub struct PacketHeaderStage {
     /// Default header order for Chrome-like browsers (used when profile doesn't specify).
+    /// This is the fallback when no explicit `packet_headers.header_order` is in the profile.
     default_header_order: Vec<String>,
+
     /// Default HTTP/2 pseudo-header order.
+    /// Chrome's order: [:method, :authority, :scheme, :path]
     default_h2_pseudo_order: Vec<String>,
-    /// Default header case mapping for HTTP/1.1.
+
+    /// Default header case mapping for HTTP/1.1 (lowercase -> ProperCase).
+    /// Used when profile doesn't specify `packet_headers.header_case`.
     default_header_case: HashMap<String, String>,
 }
 
@@ -64,6 +203,18 @@ impl PacketHeaderStage {
     }
 
     /// Chrome's typical HTTP/1.1 header order (based on real browser captures).
+    ///
+    /// This ordering was captured from Chrome 120+ on Windows. Key characteristics:
+    /// - Host is always first
+    /// - Connection header early for HTTP/1.1
+    /// - sec-ch-ua client hints come before User-Agent
+    /// - sec-fetch-* headers grouped together
+    /// - Cookie near the end
+    /// - Content-Type/Content-Length last (for POST requests)
+    ///
+    /// Note: Chrome may add/remove headers based on request context (e.g., no Origin
+    /// for same-origin GET, no sec-ch-ua for non-HTTPS). The reorderer only orders
+    /// headers that are present, preserving absent headers as absent.
     fn chrome_header_order() -> Vec<String> {
         vec![
             "host".to_string(),
@@ -91,6 +242,15 @@ impl PacketHeaderStage {
     }
 
     /// Firefox's typical HTTP/1.1 header order.
+    ///
+    /// Firefox differs significantly from Chrome/Chromium:
+    /// - User-Agent comes SECOND (not ninth like Chrome)
+    /// - Accept headers grouped together early
+    /// - No sec-ch-* headers (Firefox doesn't implement Client Hints API)
+    /// - Includes TE header (Transfer-Encoding preferences)
+    /// - sec-fetch-* ordering is different from Chrome
+    ///
+    /// Captured from Firefox 121+ on Windows/Linux.
     fn firefox_header_order() -> Vec<String> {
         vec![
             "host".to_string(),
@@ -116,6 +276,15 @@ impl PacketHeaderStage {
     }
 
     /// Edge's typical HTTP/1.1 header order (similar to Chrome with minor variations).
+    ///
+    /// Microsoft Edge is Chromium-based, so its header order is nearly identical to Chrome.
+    /// Subtle differences:
+    /// - DNT header may be absent (Edge doesn't set by default)
+    /// - sec-ch-ua-platform may appear in slightly different position
+    /// - Edge-specific headers may be present (but not in this default order)
+    ///
+    /// For most fingerprinting purposes, Edge and Chrome are interchangeable.
+    /// Captured from Edge 120+ on Windows.
     fn edge_header_order() -> Vec<String> {
         vec![
             "host".to_string(),
@@ -386,7 +555,36 @@ impl PacketHeaderStage {
     }
 
     /// Reorders headers according to the specified order.
-    /// Headers not in the order list are appended at the end.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. **First pass**: Iterate through the target order list. For each header name in the
+    ///    order, if that header exists in the input, add it to the new HeaderMap.
+    ///
+    /// 2. **Second pass**: Iterate through remaining headers not in the order list and
+    ///    append them at the end. This preserves any custom/unusual headers while ensuring
+    ///    standard headers are in the expected position.
+    ///
+    /// # Case Handling
+    ///
+    /// The `http` crate normalizes all header names to lowercase internally. The `case_map`
+    /// parameter tracks the original capitalization (e.g., "user-agent" -> "User-Agent")
+    /// for use in serialization. However, due to http crate limitations, the actual
+    /// HeaderMap will contain lowercase keys.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - The reordered HeaderMap
+    /// - A Vec of header names in the order they were added (for telemetry/debugging)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Input headers (random order): accept-encoding, user-agent, host, accept
+    /// // Target order: host, user-agent, accept, accept-encoding
+    /// // Result: host, user-agent, accept, accept-encoding (reordered)
+    /// ```
     fn reorder_headers(
         &self,
         headers: &HeaderMap,
@@ -443,8 +641,36 @@ impl Default for PacketHeaderStage {
 
 #[async_trait]
 impl FlowStage for PacketHeaderStage {
+    /// Processes an incoming HTTP request to apply header ordering and extract TCP hints.
+    ///
+    /// # Processing Steps
+    ///
+    /// 1. **Read profile config**: Gets the browser profile from `flow.metadata.fingerprint_config`
+    ///    (populated by HeaderProfileStage which runs before us).
+    ///
+    /// 2. **Extract configuration**: Reads header_order, header_case, h2_pseudo_order, and
+    ///    tcp_fingerprint settings from the profile JSON. Falls back to defaults if not specified.
+    ///
+    /// 3. **Capture original order**: Records the original header order for telemetry comparison.
+    ///
+    /// 4. **Reorder headers**: Applies the target browser's header ordering to the request.
+    ///
+    /// 5. **Populate context**: Creates PacketHeaderContext with all ordering info and TCP
+    ///    fingerprint hints for downstream use (serialization, eBPF coordination).
+    ///
+    /// 6. **Add telemetry markers**: Records what modifications were made for debugging.
+    ///
+    /// # Side Effects
+    ///
+    /// - Modifies `flow.request.headers` to new ordering
+    /// - Populates `flow.metadata.packet_headers` with full context
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns Ok. Header reordering cannot fail, and profile parsing
+    /// falls back to defaults on invalid/missing data.
     async fn on_request(&self, flow: &mut Flow) -> Result<()> {
-        // Skip if no profile is loaded yet (HeaderProfileStage runs before us)
+        // Read profile from metadata (HeaderProfileStage populates this before us)
         let profile = &flow.metadata.fingerprint_config;
 
         // Extract configuration from profile
@@ -492,10 +718,39 @@ impl FlowStage for PacketHeaderStage {
         Ok(())
     }
 
+    /// Processes HTTP response headers from upstream.
+    ///
+    /// # Response Processing
+    ///
+    /// Response header ordering is less critical for fingerprint evasion since:
+    /// 1. The server controls response header order, not the client
+    /// 2. Fingerprinting services focus on REQUEST patterns (what the client sends)
+    /// 3. Proxies typically pass response headers through unchanged
+    ///
+    /// However, some scenarios may require response header manipulation:
+    /// - Stripping or modifying server fingerprint headers (Server, X-Powered-By)
+    /// - Normalizing Set-Cookie header ordering for consistency
+    /// - Ensuring CORS headers appear in expected positions
+    ///
+    /// # Current Implementation
+    ///
+    /// Currently, this method only adds a telemetry marker indicating that response
+    /// headers were processed. Future versions may implement response header reordering
+    /// if specific evasion scenarios require it.
+    ///
+    /// # Side Effects
+    ///
+    /// Adds "response_headers_processed" to `flow.metadata.packet_headers.markers`
+    /// if packet header processing is enabled.
     async fn on_response_headers(&self, flow: &mut Flow) -> Result<()> {
-        // For responses, we may want to reorder headers when sending back to client
-        // to maintain consistency, but this is less critical for fingerprint evasion.
-        // Mark that response processing occurred.
+        // Response header ordering is less critical for fingerprint evasion since
+        // fingerprinting services focus on REQUEST patterns. Currently we just mark
+        // that processing occurred for telemetry purposes.
+        //
+        // Future enhancement: Consider reordering response headers for scenarios like:
+        // - Stripping server fingerprint headers
+        // - Normalizing Set-Cookie order
+        // - CORS header positioning
         if flow.metadata.packet_headers.enabled {
             flow.metadata
                 .packet_headers

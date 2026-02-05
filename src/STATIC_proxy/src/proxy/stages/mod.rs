@@ -17,10 +17,60 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 */
 
+/// # Flow Stages - HTTP Request/Response Processing Pipeline
+///
 /// Flow stages replicate the mitmproxy addon chain that lives under `src/proxy/AOs/` in the
 /// legacy tree. Each stage implements [`FlowStage`] and the `StagePipeline` drives them in
 /// the same deterministic order so HTTP request/response mutations stay identical between
 /// the Python prototype and `static_proxy/src/proxy/stages/`.
+///
+/// ## Stage Ordering (Critical for Correctness)
+///
+/// Stages run in a specific order. Each stage may depend on data populated by earlier stages:
+///
+/// ```text
+/// REQUEST FLOW (left to right):
+/// ┌──────────────┐   ┌───────────────┐   ┌───────────────┐   ┌─────────────────┐
+/// │    Cookie    │ → │ HeaderProfile │ → │ PacketHeaders │ → │ BehavioralNoise │ → ...
+/// │  Isolation   │   │   (loads      │   │  (reorders    │   │                 │
+/// │              │   │    profile)   │   │   headers)    │   │                 │
+/// └──────────────┘   └───────────────┘   └───────────────┘   └─────────────────┘
+///        ↓                  ↓                   ↓                    ↓
+///    partitions         sets             needs profile        may add headers
+///    cookies by      fingerprint_config  config from prev
+///    top-site
+/// ```
+///
+/// ## Stage Responsibilities
+///
+/// 1. **CookieIsolationStage**: Partitions cookies by top-level site (eTLD+1) to prevent
+///    cross-site tracking. Uses Public Suffix List for domain classification.
+///
+/// 2. **HeaderProfileStage**: Loads browser profile JSON, sets User-Agent, populates
+///    `flow.metadata.fingerprint_config` for downstream stages.
+///
+/// 3. **PacketHeaderStage**: Reorders HTTP headers to match browser fingerprints.
+///    Extracts TCP fingerprint hints for eBPF coordination. MUST run after HeaderProfileStage.
+///
+/// 4. **BehavioralNoiseStage**: Adds timing variations and request patterns to mimic
+///    human behavior. May inject additional headers or delays.
+///
+/// 5. **CspStage**: Handles Content-Security-Policy headers, injects nonces for inline
+///    scripts, stores original CSP for later restoration.
+///
+/// 6. **JsInjectionStage**: Injects JavaScript for fingerprint spoofing, canvas noise,
+///    WebGL modifications, etc. Uses nonces from CspStage.
+///
+/// 7. **AltSvcStage**: Manages Alt-Svc headers to control HTTP/2 and HTTP/3 upgrades.
+///
+/// ## Adding New Stages
+///
+/// To add a new stage:
+/// 1. Create a new module file (e.g., `my_stage.rs`)
+/// 2. Implement `FlowStage` trait
+/// 3. Add `mod my_stage;` and `pub use my_stage::MyStage;` below
+/// 4. Add `stages.push(Arc::new(MyStage::new()));` in `StagePipeline::build()` at correct position
+/// 5. Document any stage ordering dependencies
 
 mod alt_svc;
 mod behavior;
@@ -64,12 +114,22 @@ impl StagePipeline {
         let psl = Arc::new(publicsuffix::List::new());
         stages.push(Arc::new(CookieIsolationStage::new(psl)));
 
+        // HeaderProfileStage MUST be early - it loads browser profile JSON into
+        // flow.metadata.fingerprint_config which downstream stages depend on.
         stages.push(Arc::new(HeaderProfileStage::new(
             cfg.profiles_path.clone(),
             cfg.default_profile.clone(),
         )?));
-        // PacketHeaderStage runs after HeaderProfileStage to access fingerprint config,
-        // reorders HTTP headers for stealth and extracts TCP fingerprint hints for eBPF.
+
+        // PacketHeaderStage - CRITICAL FOR STEALTH
+        // Must run AFTER HeaderProfileStage to access fingerprint_config.
+        // Does:
+        //   1. Reorders HTTP headers to match browser-specific patterns (Chrome/Firefox/Edge)
+        //   2. Maps header capitalization for HTTP/1.1 (case-sensitive on wire)
+        //   3. Sets HTTP/2 pseudo-header ordering (:method, :authority, :scheme, :path)
+        //   4. Extracts TCP fingerprint hints (TTL, MSS, window size) for eBPF module
+        // The TCP hints in flow.metadata.packet_headers.tcp_fingerprint should be
+        // pushed to the eBPF fingerprint_settings map for kernel-level spoofing.
         stages.push(Arc::new(PacketHeaderStage::new()));
         stages.push(Arc::new(BehavioralNoiseStage::new()));
         stages.push(Arc::new(CspStage::default()));
